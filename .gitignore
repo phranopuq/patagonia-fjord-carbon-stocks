@@ -1,0 +1,21 @@
+# Raw input data (not distributed with the repository; see data/README.md)
+data/*.csv
+data/*.shp
+data/*.shx
+data/*.dbf
+data/*.prj
+data/*.cpg
+data/*.qmd
+
+# R scratch / session files
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# Knitting intermediates (final HTML in output/ is intentionally tracked)
+*.html
+!output/*.html
+
+# OS/editor cruft
+.DS_Store

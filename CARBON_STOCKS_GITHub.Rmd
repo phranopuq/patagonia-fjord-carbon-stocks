@@ -1,0 +1,934 @@
+---
+title: "Post-glacial sediment carbon stock — Basin `r params$basin`"
+author: "Francisco Rios et al."
+date: "2026"
+params:
+  basin: "BT"          # "BC" or "BT" — single switch for the whole notebook
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+    fig_caption: true
+    df_print: kable
+knit: (function(inputFile, encoding) { rmarkdown::render(inputFile, encoding = encoding, output_dir = "output", output_file = paste0("CARBON_STOCKS_", rmarkdown::yaml_front_matter(inputFile)$params$basin, ".html")) })
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.align = "center", fig.width = 7.2, fig.height = 4.5, dpi = 300
+)
+```
+
+# Overview
+
+Full-column post-glacial sediment carbon stock of Basin `r params$basin` from (i) a
+geostatistical model of sediment thickness built from parametric echo-sounder
+profiles and (ii) the geochemistry of the depocentre cores. Sediment thickness
+is the difference between the basin floor and the basal acoustic horizon (base
+of the post-glacial sediment fill); each horizon is interpolated by conditional
+simulation, and the 1000 realisations are propagated through the volume and
+stock calculations to give Monte Carlo uncertainty (95% simulation intervals
+throughout, computed as the 2.5th and 97.5th percentiles across the 1000
+realisations).
+
+## Data and code availability
+
+This notebook accompanies the Data Availability statement of Ríos et al.
+(manuscript). It reproduces the sediment-thickness simulation, carbon-stock
+integration, and stratigraphic sensitivity test reported in the manuscript
+for both basins (Bahía Caribe, BC; Bahía Trampa, BT), switched by the single
+`basin` YAML parameter above. The raw acoustic picks, core geochemistry, and
+basin-outline shapefiles are **not** distributed in this repository; they are
+archived in PANGAEA (Ríos et al., 2020a, b;
+https://doi.org/10.1594/PANGAEA.900787 for BT and
+https://doi.org/10.1594/PANGAEA.900786 for BC) or available from the
+corresponding author on request. To reproduce the analysis, place the
+following basin-specific input files in the working directory before
+knitting: `{basin}_surface.csv`, `{basin}_bottom.csv`, `{basin}_core.csv`,
+`{basin}_area.shp` (with its sidecar files), and the shared
+`Gravities_BC_BT.csv`.
+
+```{r libs}
+library(terra)
+library(sf)
+library(sp)
+library(gstat)
+library(ggplot2)
+library(scales)
+library(patchwork)
+set.seed(123)
+# --- Basin selection -----------------------------------------------------
+# Single source of truth: the YAML param. To switch basin, edit the YAML
+# header (params: basin: "BC" -> "BT"); nothing in the body needs changing.
+basin_label <- params$basin
+stopifnot(basin_label %in% c("BC", "BT"))
+
+# Basin-specific acquisition geometry.
+# Anisotropy: major-axis azimuth (degrees clockwise from N) and minor/major
+# axis ratio. Empirical variogram cutoff and lag width are left to the gstat 
+# default (1/3 of the bounding-box diagonal; cutoff/15). 
+# Manuscript: BC ~90 m N-S tracks, BT ~30 m NE-SW tracks.
+sep_tracks   <- if (basin_label == "BC") 90 else 30   # nominal track separation (m)
+anis_azimuth <- if (basin_label == "BC") 0 else 45
+anis_ratio   <- 0.5
+
+# Basin-specific data files
+f_surface <- paste0(basin_label, "_surface.csv")
+f_bottom  <- paste0(basin_label, "_bottom.csv")
+f_core    <- paste0(basin_label, "_core.csv")
+f_outline <- paste0(basin_label, "_area.shp")
+```
+
+# Data
+
+```{r data}
+sup  <- read.csv(f_surface)    # basin floor (x, y, z)
+fon  <- read.csv(f_bottom)     # basal acoustic horizon, base of post-glacial sediment fill (x, y, z)
+core <- read.csv(f_core)       # composite core: depth, DBD, TC, OC
+shp  <- vect(f_outline)        # basin outline
+
+stopifnot(all(c("x", "y", "z") %in% colnames(sup)))
+stopifnot(all(c("x", "y", "z") %in% colnames(fon)))
+stopifnot(all(c("depth", "DBD", "TC", "OC") %in% colnames(core)))
+```
+
+```{r picked-thickness-envelope}
+# Pair seafloor and basal-horizon picks by nearest neighbour, with a tight
+# distance window. This works whether the two files share (x, y) exactly
+# (BC: distances ~ 0) or only sample the same survey line at different
+# along-track positions (BT). The resulting envelope of fill thickness is
+# then used to clip the conditional simulation downstream.
+
+picks_sup <- st_as_sf(sup, coords = c("x", "y"), crs = 32718)
+picks_fon <- st_as_sf(fon, coords = c("x", "y"), crs = 32718)
+nn        <- st_nearest_feature(picks_fon, picks_sup)
+dist_nn   <- as.numeric(st_distance(picks_fon, picks_sup[nn, ], by_element = TRUE))
+
+picks <- data.frame(x       = fon$x,
+                    y       = fon$y,
+                    z_sup   = sup$z[nn],
+                    z_fon   = fon$z,
+                    dist_m  = dist_nn)
+picks <- picks[picks$dist_m <= 5, ]   # pairing window (m)
+picks$thick_picked <- picks$z_sup - picks$z_fon
+
+thick_picked_max <- max(picks$thick_picked, na.rm = TRUE)
+
+if (!is.finite(thick_picked_max) || thick_picked_max <= 0) {
+  stop("Picked thickness envelope is not valid. Check sup/fon CSVs and the CRS.")
+}
+
+data.frame(n_pairs  = nrow(picks),
+           min_m    = round(min(picks$thick_picked,  na.rm = TRUE), 2),
+           median_m = round(median(picks$thick_picked, na.rm = TRUE), 2),
+           max_m    = round(thick_picked_max, 2))
+```
+
+```{r to-spatial}
+sup_sf <- st_as_sf(sup, coords = c("x", "y"), crs = 32718)
+fon_sf <- st_as_sf(fon, coords = c("x", "y"), crs = 32718)
+sup_sp <- as(sup_sf, "Spatial"); fon_sp <- as(fon_sf, "Spatial")
+sup_sp <- sup_sp[!duplicated(coordinates(sup_sp)), ]
+fon_sp <- fon_sp[!duplicated(coordinates(fon_sp)), ]
+```
+
+# Variogram modelling and cross-validation
+
+```{r variograms}
+# Variogram model: Gaussian without detrending (z ~ 1). The choice was
+# validated by sweeping over spherical, exponential and Gaussian models
+# with and without first-order detrending for the four surfaces (BC and
+# BT, basin floor and basal acoustic horizon); the Gaussian model without
+# detrending converged consistently for all four. Empirical variograms use 
+# the gstat automatic cutoff (1/3 of the bounding-box diagonal) and lag width (cutoff / 15).
+# Multi-start fitting (four initial range values scaled to the empirical
+# variogram maximum lag) is used to avoid local minima.
+
+vg_sup  <- variogram(z ~ 1, sup_sp)
+vg_fon  <- variogram(z ~ 1, fon_sp)
+var_sup <- var(sup_sp$z, na.rm = TRUE)
+var_fon <- var(fon_sp$z, na.rm = TRUE)
+
+# Multi-start fit. Four initial ranges are scaled to the empirical
+# variogram maximum lag; the fit with the lowest SSErr is kept. Negative
+# fit components (numerical error) are snapped to zero. A small jitter
+# nugget is added if the optimizer converges to nugget = 0; this prevents
+# singular kriging matrices when nearby picks lie along the same survey
+# track (a known pathology of the Gaussian model with no nugget).
+fit_with_restarts <- function(vg, var_z, anis, min_nugget_frac = 0.01) {
+  vg_maxdist  <- max(vg$dist)
+  init_ranges <- vg_maxdist * c(0.2, 0.4, 0.6, 0.8)
+  best_fit <- NULL; best_sse <- Inf
+  for (ir in init_ranges) {
+    # fit.method = 7: weighted least squares, weights proportional to
+    # Npairs / gamma^2 (the gstat/Cressie default weighting scheme).
+    f <- tryCatch(
+      fit.variogram(vg,
+        vgm(psill = 0.7 * var_z, model = "Gau", range = ir,
+            nugget = 0.05 * var_z, anis = anis),
+        fit.method = 7),
+      warning = function(w) NULL, error = function(e) NULL)
+    if (is.null(f)) next
+    f$psill[f$psill < 0] <- 0
+    f$range[f$range < 0] <- 0
+    sse <- attr(f, "SSErr")
+    if (!is.null(sse) && is.finite(sse) && sse < best_sse) {
+      best_sse <- sse; best_fit <- f
+    }
+  }
+  if (is.null(best_fit)) return(NULL)
+
+  # Inject a jitter nugget if the optimizer converged to zero
+  psill_struct <- sum(best_fit$psill[best_fit$model != "Nug"])
+  has_nug      <- any(best_fit$model == "Nug")
+  nug_val      <- if (has_nug) best_fit$psill[best_fit$model == "Nug"] else 0
+
+  if (nug_val < min_nugget_frac * psill_struct) {
+    jitter <- min_nugget_frac * psill_struct
+    if (has_nug) {
+      best_fit$psill[best_fit$model == "Nug"] <- jitter
+    } else {
+      best_fit <- rbind(
+        data.frame(model = "Nug", psill = jitter, range = 0,
+                   kappa = 0, ang1 = 0, ang2 = 0, ang3 = 0,
+                   anis1 = 1, anis2 = 1),
+        best_fit)
+      class(best_fit) <- c("variogramModel", "data.frame")
+    }
+  }
+  best_fit
+}
+
+fit_sup <- fit_with_restarts(vg_sup, var_sup,
+                             anis = c(anis_azimuth, anis_ratio))
+fit_fon <- fit_with_restarts(vg_fon, var_fon,
+                             anis = c(anis_azimuth, anis_ratio))
+
+stopifnot(!is.null(fit_sup), !is.null(fit_fon))
+
+cv_sup <- krige.cv(z ~ 1, sup_sp, model = fit_sup, nmax = 40, nmin = 5)
+cv_fon <- krige.cv(z ~ 1, fon_sp, model = fit_fon, nmax = 40, nmin = 5)
+
+metrics <- function(cv){
+  res <- cv$residual
+  c(RMSE = sqrt(mean(res^2, na.rm = TRUE)),
+    ME   = mean(res, na.rm = TRUE),
+    R2   = cor(cv$observed, cv$var1.pred, use = "complete.obs")^2)
+}
+cv_table <- rbind("basin floor"   = metrics(cv_sup),
+                  "basal horizon" = metrics(cv_fon))
+knitr::kable(round(cv_table, 3),
+             caption = paste0("Basin ", basin_label,
+                              ": leave-one-out cross-validation (Supplementary)."))
+
+fit_table <- rbind(
+  "basin floor"   = c(nugget = if (any(fit_sup$model == "Nug")) fit_sup$psill[fit_sup$model == "Nug"] else 0,
+                      psill  = sum(fit_sup$psill[fit_sup$model != "Nug"]),
+                      range  = max(fit_sup$range[fit_sup$model != "Nug"])),
+  "basal horizon" = c(nugget = if (any(fit_fon$model == "Nug")) fit_fon$psill[fit_fon$model == "Nug"] else 0,
+                      psill  = sum(fit_fon$psill[fit_fon$model != "Nug"]),
+                      range  = max(fit_fon$range[fit_fon$model != "Nug"])))
+knitr::kable(round(fit_table, 2),
+             caption = paste0("Basin ", basin_label,
+                              ": fitted Gaussian variogram parameters."))
+```
+
+```{r variogram-figure, fig.width=7, fig.height=4, fig.cap=paste0("Basin ", basin_label, ": empirical (points) and fitted Gaussian (line) variograms for the basin floor and basal acoustic horizon. Point size scales with the number of pairs per lag.")}
+
+# Fitted-model lines, evaluated to the maximum observed lag
+vline_sup <- variogramLine(fit_sup, maxdist = max(vg_sup$dist))
+vline_fon <- variogramLine(fit_fon, maxdist = max(vg_fon$dist))
+
+vg_data <- rbind(
+  data.frame(dist = vg_sup$dist, gamma = vg_sup$gamma, np = vg_sup$np,
+             horizon = "Basin floor"),
+  data.frame(dist = vg_fon$dist, gamma = vg_fon$gamma, np = vg_fon$np,
+             horizon = "Basal horizon"))
+vline_data <- rbind(
+  data.frame(dist = vline_sup$dist, gamma = vline_sup$gamma, horizon = "Basin floor"),
+  data.frame(dist = vline_fon$dist, gamma = vline_fon$gamma, horizon = "Basal horizon"))
+
+vg_data$horizon    <- factor(vg_data$horizon,    levels = c("Basin floor", "Basal horizon"))
+vline_data$horizon <- factor(vline_data$horizon, levels = c("Basin floor", "Basal horizon"))
+
+p_variogram <- ggplot(vg_data, aes(dist, gamma)) +
+  geom_point(aes(size = np), shape = 21, fill = "grey70", colour = "black") +
+  geom_line(data = vline_data, colour = "#d95f02", linewidth = 0.8) +
+  facet_wrap(~ horizon, scales = "free", ncol = 2) +
+  scale_size_continuous(range = c(1, 4), name = "N pairs") +
+  labs(x = "Distance (m)",
+       y = expression("Semivariance ("*m^2*")")) +
+  theme_classic(base_size = 10) +
+  theme(legend.position  = "right",
+        strip.background = element_blank(),
+        strip.text       = element_text(face = "bold"))
+
+p_variogram
+```
+
+```{r cv-figure, fig.width=8, fig.height=5.5, fig.cap="Cross-validation of the basin floor (A–C) and basal horizon (D–F): observed vs predicted, residual distribution, Q–Q (Supplementary)."}
+df_sup <- as.data.frame(cv_sup); df_fon <- as.data.frame(cv_fon)
+lims <- range(c(df_sup$observed, df_sup$var1.pred, df_fon$observed, df_fon$var1.pred), na.rm = TRUE)
+
+theme_fig <- theme_classic(base_size = 10) +
+  theme(plot.title = element_text(size = 10, face = "bold"), plot.tag.position = c(0.1, 1))
+
+op <- function(df, lab) ggplot(df, aes(observed, var1.pred)) +
+  geom_point(size = 1.1, alpha = 0.7) +
+  geom_abline(slope = 1, linetype = "dashed", linewidth = 0.4) +
+  coord_equal(xlim = lims, ylim = lims) + labs(title = lab, x = "Observed", y = "Predicted") + theme_fig
+hh <- function(df) ggplot(df, aes(residual)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 20, fill = "grey85", colour = "black", linewidth = 0.3) +
+  geom_density(linewidth = 0.6) + geom_vline(xintercept = 0, linewidth = 0.4) +
+  labs(title = "Residuals", x = "Residual", y = "Density") + theme_fig
+qq <- function(df) ggplot(df, aes(sample = residual)) + stat_qq(size = 1.1) + stat_qq_line(linewidth = 0.5) +
+  labs(title = "Normal Q\u2013Q", x = "Theoretical", y = "Sample") + theme_fig
+
+(op(df_sup, "Basin floor") | hh(df_sup) | qq(df_sup)) /
+  (op(df_fon, "Basal horizon") | hh(df_fon) | qq(df_fon)) + plot_annotation(tag_levels = "a") -> p_cv
+
+p_cv
+```
+
+# Conditional simulation
+
+```{r grid}
+xrange <- range(c(sup$x, fon$x)); yrange <- range(c(sup$y, fon$y))
+resol  <- sep_tracks / 3
+grd <- expand.grid(x = seq(xrange[1], xrange[2], by = resol),
+                   y = seq(yrange[1], yrange[2], by = resol))
+coordinates(grd) <- ~x + y; gridded(grd) <- TRUE
+proj4string(grd) <- proj4string(sup_sp)
+```
+
+```{r simulate, results='hide'}
+sim_sup <- krige(z ~ 1, sup_sp, grd, model = fit_sup, nsim = 1000, nmax = 50, maxdist = fit_sup$range[2])
+sim_fon <- krige(z ~ 1, fon_sp, grd, model = fit_fon, nsim = 1000, nmax = 50, maxdist = fit_fon$range[2])
+```
+
+# Sediment thickness and basin volume
+
+```{r thickness}
+r_sup <- mask(crop(rast(sim_sup), shp), shp)
+r_fon <- mask(crop(rast(sim_fon), shp), shp)
+
+sim_stack <- r_sup - r_fon
+sim_stack <- ifel(sim_stack < 0, 0, sim_stack)
+
+# Clip simulated thickness to the picked envelope. This is the operative
+# constraint: it forces each cell, in each realisation, to stay within the
+# range of fill thicknesses actually observed in paired picks.
+sim_stack <- ifel(sim_stack > thick_picked_max, thick_picked_max, sim_stack)
+```
+
+```{r volume}
+cell_area  <- cellSize(sim_stack)
+cover_frac <- rasterize(shp, sim_stack, cover = TRUE)
+w          <- cell_area * cover_frac              # effective area per cell (m2)
+area_real  <- global(w, "sum", na.rm = TRUE)[1, 1]
+
+vol_r      <- sim_stack * w
+vol_values <- as.numeric(global(vol_r, "sum", na.rm = TRUE)[, 1])
+mean_vol   <- mean(vol_values)
+ci_vol     <- quantile(vol_values, c(0.025, 0.975))   # 95% simulation interval
+
+fmt <- label_scientific()
+data.frame(Mean_vol_m3 = fmt(mean_vol),
+           SimInt_95_vol = paste0("[", fmt(ci_vol[1]), " - ", fmt(ci_vol[2]), "]"))
+```
+
+```{r thickness-figure, fig.width=7.5, fig.height=6, fig.cap=paste0("Basin ", basin_label, ": (A) mean simulated sediment thickness, (B) thickness uncertainty (SD), (C) Monte Carlo volume distribution.")}
+r_mean <- app(sim_stack, mean, na.rm = TRUE)
+r_sd   <- app(sim_stack, function(x) sd(x, na.rm = TRUE))
+df_mean <- as.data.frame(r_mean, xy = TRUE, na.rm = TRUE); colnames(df_mean)[3] <- "thick"
+df_sd   <- as.data.frame(r_sd,   xy = TRUE, na.rm = TRUE); colnames(df_sd)[3]   <- "sd"
+
+theme_fig2 <- theme_classic(base_size = 10) +
+  theme(plot.title = element_text(size = 10, face = "bold"), plot.tag.position = c(0.08, 1))
+
+pA <- ggplot(df_mean, aes(x, y, fill = thick)) + geom_raster() + scale_fill_viridis_c() +
+  coord_equal() + ggtitle("Mean thickness") + labs(x = "East (m)", y = "North (m)") +
+  scale_x_continuous(n.breaks = 3) + theme_fig2
+pB <- ggplot(df_sd, aes(x, y, fill = sd)) + geom_raster() + scale_fill_viridis_c() +
+  coord_equal() + ggtitle("Uncertainty") + labs(x = "East (m)", y = "North (m)") +
+  scale_x_continuous(n.breaks = 3) + theme_fig2
+pC <- ggplot(data.frame(volume = vol_values), aes(volume)) +
+  geom_histogram(bins = 30, fill = "grey70") +
+  geom_vline(xintercept = mean_vol, linewidth = 0.8) +
+  geom_vline(xintercept = ci_vol, linetype = "dashed", linewidth = 0.6) +
+  labs(x = "Volume (m\u00b3)", y = "Frequency", title = "Volume distribution") + theme_fig2
+
+p_thickness <- (pA | pB) / pC + plot_layout(heights = c(3, 1)) + plot_annotation(tag_levels = "a")
+
+p_thickness
+```
+
+# Core geochemistry and carbon density profiles
+
+Total carbon (TC) is measured by elemental analysis and organic carbon (OC) by
+combustion after acid digestion to remove carbonate; inorganic carbon (IC) is
+taken as the difference: IC = TC − OC. Dry bulk density (DBD) is converted to
+kg m^-3^ by multiplying by 1000. Organic and inorganic carbon densities are
+obtained by multiplying DBD by OC and IC, each divided by 100 (OC and IC are
+recorded as weight percent). Each density profile is integrated over depth to
+give cumulative organic and inorganic carbon (kg m^-2^).
+
+```{r core-profile}
+core <- core[order(core$depth), ]
+core <- core[!duplicated(core$depth), ]
+
+core$rho_kg_m3 <- core$DBD * 1000        # dry bulk density (kg m-3)
+core$IC        <- core$TC - core$OC      # inorganic carbon (wt%) = TC - OC
+core$fC        <- core$OC / 100          # OC mass fraction
+core$fIC       <- core$IC / 100          # IC mass fraction
+core$dens_C    <- core$rho_kg_m3 * core$fC    # OC density (kg m-3)
+core$dens_IC   <- core$rho_kg_m3 * core$fIC   # IC density (kg m-3)
+
+dz          <- diff(core$depth) / 100        # m (depth in cm)
+core$C_acum  <- cumsum(c(0, core$dens_C[-1]  * dz))
+core$IC_acum <- cumsum(c(0, core$dens_IC[-1] * dz))
+```
+
+```{r core-figure, fig.width=8, fig.height=4, fig.cap=paste0("Basin ", basin_label, ": down-core organic and inorganic carbon density (kg m-3) and cumulative carbon (kg m-2).")}
+p1 <- ggplot(core, aes(dens_C,  depth)) + geom_path() + scale_y_reverse() +
+  labs(x = "OC density (kg m-3)", y = "Depth (cm)") + theme_fig2
+p2 <- ggplot(core, aes(dens_IC, depth)) + geom_path() + scale_y_reverse() +
+  labs(x = "IC density (kg m-3)", y = "") + theme_fig2
+p3 <- ggplot(core, aes(C_acum,  depth)) + geom_path(linewidth = 1) + scale_y_reverse() +
+  labs(x = "Cumulative OC (kg m-2)", y = "") + theme_fig2
+p4 <- ggplot(core, aes(IC_acum, depth)) + geom_path(linewidth = 1) + scale_y_reverse() +
+  labs(x = "Cumulative IC (kg m-2)", y = "") + theme_fig2
+p_core <- (p1 | p2 | p3 | p4) + plot_annotation(tag_levels = "a")
+
+p_core
+```
+
+# Basin carbon stock (full sediment column)
+
+The carbon held in a column of thickness *H* is the cumulative carbon profile
+evaluated at *H* (kg m^-2^). Below the deepest sample, density is held
+constant at the deepest measured value (this rule is supported by the
+down-core stabilisation of OC and IC densities noted in the manuscript from
+7.5 m in BC and 8.0 m in BT; Fig. 3). The per-cell areal carbon density is
+then multiplied by the same effective cell area used for the volume, and the
+resulting cell inventories are summed over the basin for each of the 1000
+realisations. Evaluated at the core base, the same profile gives the
+full-column inventory at the depocentre (kg m^-2^), reported at the end of
+this section.
+
+```{r carbon-functions}
+H_core_max_cm <- max(core$depth)
+acc_C   <- approxfun(core$depth, core$C_acum,  rule = 2)
+acc_IC  <- approxfun(core$depth, core$IC_acum, rule = 2)
+dens_C_deep  <- tail(core$dens_C,  1)
+dens_IC_deep <- tail(core$dens_IC, 1)
+
+# areal carbon density (kg m-2) for thickness H (m), optionally capped at cap_cm,
+# extrapolating with constant deepest density below the core base
+areal_C <- function(H_m, cap_cm = Inf){
+  H_cm  <- pmin(H_m * 100, cap_cm)
+  acc_C(pmin(H_cm, H_core_max_cm)) + pmax(H_cm - H_core_max_cm, 0) / 100 * dens_C_deep
+}
+areal_IC <- function(H_m, cap_cm = Inf){
+  H_cm  <- pmin(H_m * 100, cap_cm)
+  acc_IC(pmin(H_cm, H_core_max_cm)) + pmax(H_cm - H_core_max_cm, 0) / 100 * dens_IC_deep
+}
+
+# sanity check: must reproduce the core inventory at the core base
+c(OC_core_kgm2 = areal_C(H_core_max_cm / 100),
+  IC_core_kgm2 = areal_IC(H_core_max_cm / 100))
+```
+
+```{r basin-stock}
+H_mat <- values(sim_stack)        # cells x 1000 thickness (m)
+w_vec <- values(w)[, 1]           # cells effective area (m2)
+
+oc_areal <- apply(H_mat, 2, areal_C)
+ic_areal <- apply(H_mat, 2, areal_IC)
+
+stock_C  <- colSums(oc_areal * w_vec, na.rm = TRUE)   # kg per realisation
+stock_IC <- colSums(ic_areal * w_vec, na.rm = TRUE)
+stock_C_ton  <- stock_C  / 1e3
+stock_IC_ton <- stock_IC / 1e3
+
+C_results  <- c(mean = mean(stock_C_ton),
+                low95 = quantile(stock_C_ton, 0.025), high95 = quantile(stock_C_ton, 0.975))
+IC_results <- c(mean = mean(stock_IC_ton),
+                low95 = quantile(stock_IC_ton, 0.025), high95 = quantile(stock_IC_ton, 0.975))
+names(C_results) <- names(IC_results) <- c("mean", "low95", "high95")
+
+OC_areal_basin <- mean(stock_C)  / area_real
+IC_areal_basin <- mean(stock_IC) / area_real
+
+data.frame(
+  OC_stock_ton = fmt(C_results["mean"]),
+  OC_SimInt_95 = paste0("[", fmt(C_results["low95"]), " - ", fmt(C_results["high95"]), "]"),
+  IC_stock_ton = fmt(IC_results["mean"]),
+  IC_SimInt_95 = paste0("[", fmt(IC_results["low95"]), " - ", fmt(IC_results["high95"]), "]"),
+  row.names = NULL
+)
+```
+
+```{r basin-stock-checks}
+# convergence check: depth-resolved stock vs mean-density x volume (should be ~1)
+crosscheck_C_ton <- mean(vol_values) * mean(core$dens_C) / 1e3
+
+# basin-mean fill thickness and bulk (volumetric) carbon density, for
+# comparison with the areal densities above (manuscript §3.2: 29.0 kg m-3 in
+# BC, 26.5 kg m-3 in BT)
+mean_thick    <- mean_vol / area_real                                 # m
+vol_c_density <- (OC_areal_basin + IC_areal_basin) / mean_thick       # kg m-3
+
+c(OC_areal_basin_kgm2 = round(OC_areal_basin, 1),
+  IC_areal_basin_kgm2 = round(IC_areal_basin, 1),
+  mean_thick_m         = round(mean_thick, 2),
+  vol_c_density_kgm3   = round(vol_c_density, 1),
+  convergence_ratio    = round(as.numeric(crosscheck_C_ton / C_results["mean"]), 3))
+```
+
+## Extrapolation diagnostics: fraction of the fill below the core base
+
+For columns thicker than the deepest sample, the carbon-density profile is
+extended with the deepest measured value. The diagnostic below reports, across
+the 1000 thickness realisations, (i) the fraction of basin area for which the
+extrapolation is active, (ii) the fraction of sediment volume that sits below
+the core base (the quantity that actually affects the stock — only this part of
+the column is filled with the constant deepest density), (iii) the basin
+thickness maximum, and (iv) the maximum excess over the core base. The map
+shows the per-cell probability of being thicker than the core base across the
+1000 realisations.
+
+```{r extrapolation-metrics}
+H_core_max_m <- H_core_max_cm / 100      # core base in metres
+
+# cells inside the basin (positive effective area, finite thickness in H_mat)
+inside <- is.finite(w_vec) & w_vec > 0
+H_in   <- H_mat[inside, , drop = FALSE]
+a_in   <- w_vec[inside]
+A_in   <- sum(a_in)
+
+# --- Per-realisation quantities (vary across the 1000 SGS realisations) --
+extrap_per_real <- vapply(seq_len(ncol(H_in)), function(i){
+  th <- H_in[, i]; th[is.na(th)] <- 0
+  c(area_frac  = sum(a_in[th > H_core_max_m]) / A_in,
+    vol_frac   = sum(pmax(th - H_core_max_m, 0) * a_in) / sum(th * a_in),
+    max_thick  = max(th),
+    max_excess = max(th - H_core_max_m))
+}, numeric(4))
+extrap_per_real <- as.data.frame(t(extrap_per_real))
+
+# --- Per-cell statistics across the 1000 realisations -------------------
+cell_mean <- rowMeans(H_in, na.rm = TRUE)
+cell_p95  <- apply(H_in, 1, quantile, probs = 0.95, na.rm = TRUE)
+
+# --- Table 1: extrapolation fractions (95% simulation interval across the
+#             1000 realisations) ------------------------------------------
+extrap_fractions <- data.frame(
+  Metric = c("Area extrapolated (%)",
+             "Volume extrapolated (%)"),
+  Mean      = c(mean(extrap_per_real$area_frac) * 100,
+                mean(extrap_per_real$vol_frac)  * 100),
+  SimInt_lo = c(quantile(extrap_per_real$area_frac, 0.025) * 100,
+                quantile(extrap_per_real$vol_frac,  0.025) * 100),
+  SimInt_hi = c(quantile(extrap_per_real$area_frac, 0.975) * 100,
+                quantile(extrap_per_real$vol_frac,  0.975) * 100))
+extrap_fractions[, 2:4] <- round(extrap_fractions[, 2:4], 2)
+
+knitr::kable(extrap_fractions,
+  caption = paste0("Basin ", basin_label,
+                   ": fraction of the basin (area and sediment volume) lying ",
+                   "below the depocentre core base (", round(H_core_max_m, 2),
+                   " m). 95% simulation interval across the 1000 SGS realisations."))
+
+# --- Table 2: thickness statistics ---------------------------------------
+# Three statistics are reported because they answer different questions:
+#   (a) Max cell-mean thickness     : deepest expected thickness anywhere in
+#                                     the basin. Matches the mean-thickness map.
+#   (b) Max cell-P95 thickness      : conservative upper bound; the 95th
+#                                     percentile of the deepest cell.
+#   (c) Per-realisation max (mean)  : average of the per-realisation maxima.
+#                                     Heavy-tail-sensitive; reflects sporadic
+#                                     extreme cells in individual realisations
+#                                     rather than the expected basin maximum.
+thickness_stats <- data.frame(
+  Statistic = c("Max cell-mean thickness (m)",
+                "Max cell-P95 thickness (m)",
+                "Per-realisation maximum thickness (m)",
+                "Maximum excess over core base (m), per-realisation"),
+  Value     = c(round(max(cell_mean), 2),
+                round(max(cell_p95),  2),
+                round(mean(extrap_per_real$max_thick),  2),
+                round(mean(extrap_per_real$max_excess), 2)),
+  SimInt_lo = c(NA_real_,
+                NA_real_,
+                round(quantile(extrap_per_real$max_thick,  0.025), 2),
+                round(quantile(extrap_per_real$max_excess, 0.025), 2)),
+  SimInt_hi = c(NA_real_,
+                NA_real_,
+                round(quantile(extrap_per_real$max_thick,  0.975), 2),
+                round(quantile(extrap_per_real$max_excess, 0.975), 2)))
+
+knitr::kable(thickness_stats,
+  caption = paste0("Basin ", basin_label,
+                   ": thickness statistics. The first two are single-value ",
+                   "summaries over the ensemble (no interval); the last two ",
+                   "are per-realisation quantities with 95% simulation ",
+                   "interval across the 1000 SGS realisations. The per-",
+                   "realisation maximum is sensitive to heavy tails in the ",
+                   "conditional simulation ",
+                   "and is shown for diagnosis; the figure of mean simulated ",
+                   "thickness corresponds to the max cell-mean."))
+```
+
+```{r extrapolation-prob-map, fig.width=6, fig.height=5, fig.cap=paste0("Basin ", basin_label, ": per-cell probability that simulated sediment thickness exceeds the core base across the 1000 realisations.")}
+extrap_prob <- rep(NA_real_, length(w_vec))
+extrap_prob[inside] <- rowMeans(H_in > H_core_max_m, na.rm = TRUE)
+
+r_extrap_prob <- sim_stack[[1]]
+values(r_extrap_prob) <- extrap_prob
+names(r_extrap_prob)  <- "extrap_prob"
+
+df_ep <- as.data.frame(r_extrap_prob, xy = TRUE, na.rm = TRUE)
+p_extrap_prob <- ggplot(df_ep, aes(x, y, fill = extrap_prob)) +
+  geom_raster() +
+  scale_fill_viridis_c(limits = c(0, 1),
+                       name = "P(thickness > core base)") +
+  coord_equal() + labs(x = "East (m)", y = "North (m)") +
+  scale_x_continuous(n.breaks = 3) + theme_fig2
+
+p_extrap_prob
+```
+
+```{r extrapolation-thickness-histogram, fig.width=7, fig.height=4, fig.cap=paste0("Basin ", basin_label, ": distribution of mean simulated sediment thickness across cells, weighted by effective cell area. Vertical line at the depocentre core base (", round(H_core_max_m, 2), " m); cells to the right of the line require constant-density extrapolation in the stock calculation.")}
+
+H_mean_cell <- rowMeans(H_in, na.rm = TRUE)
+df_hist <- data.frame(thickness = H_mean_cell,
+                      weight    = a_in,
+                      side      = ifelse(H_mean_cell > H_core_max_m,
+                                         "Below core base (extrapolated)",
+                                         "Within cored interval"))
+
+p_thick_hist <- ggplot(df_hist, aes(x = thickness, weight = weight, fill = side)) +
+  geom_histogram(bins = 40, colour = "black", linewidth = 0.2) +
+  geom_vline(xintercept = H_core_max_m, linewidth = 0.7) +
+  annotate("text", x = H_core_max_m, y = Inf, label = " core base",
+           hjust = 0, vjust = 1.5, size = 3.2) +
+  scale_fill_manual(values = c("Within cored interval"             = "grey80",
+                               "Below core base (extrapolated)"    = "#d95f02"),
+                    name = NULL) +
+  labs(x = "Mean cell thickness (m)",
+       y = expression("Basin area ("*m^2*")")) +
+  theme_fig2 +
+  theme(legend.position = "bottom")
+
+
+p_thick_hist
+```
+
+## Stratigraphic sensitivity: bracket on the un-cored fill
+
+The depocentre core samples only the upper portion of the simulated acoustic
+fill. Two end-member scenarios bracket the basin stock without invoking any
+external value for the un-cored interval:
+
+- **A. Cored interval only (lower bound).** The column inventory is capped at
+  the core base; sediment below this depth is assigned zero carbon. This is
+  the stock that the core directly supports.
+- **B. Constant deepest measured density (default reported).** The deepest
+  cored value is extended downward through the un-cored fill. Geologically
+  justified when the deep cored facies is interpreted as continuing below the
+  core base (glaciomarine in BC, glaciolacustrine in BT; Rios et al., 2020).
+
+A third intermediate scenario using a low-OC analogue density for the deep
+facies (e.g., from a comparable Patagonian glaciomarine or glaciolacustrine
+core) can be added here once a literature value is selected. It is left out
+of the present run because we do not want to anchor the bracket on an
+unsourced assumption.
+
+```{r sensitivity-stratigraphic, fig.width=6, fig.height=4.5, fig.cap=paste0("Basin ", basin_label, ": stratigraphic bracket on the basin organic (OC) and inorganic (IC) carbon stock. Scenario A caps the column at the depocentre core base (", round(H_core_max_m, 2), " m); Scenario B extends the deepest measured density to the basal acoustic horizon (default). Bars are means across the 1000 thickness realisations; whiskers are 95% intervals.")}
+
+# --- Scenario A: cored-interval cap ---------------------------------------
+oc_areal_A <- apply(H_mat, 2, function(h) areal_C (h, cap_cm = H_core_max_cm))
+ic_areal_A <- apply(H_mat, 2, function(h) areal_IC(h, cap_cm = H_core_max_cm))
+
+# --- Scenario B: default (already computed) -------------------------------
+# oc_areal, ic_areal carry the upper-bound (constant deepest density) result.
+
+# --- Summarise each scenario ----------------------------------------------
+scenario_stocks <- function(oc_a, ic_a){
+  s_C  <- colSums(oc_a * w_vec, na.rm = TRUE) / 1e3   # t per realisation
+  s_IC <- colSums(ic_a * w_vec, na.rm = TRUE) / 1e3
+  list(OC = c(mean   = mean(s_C),
+              low95  = unname(quantile(s_C,  0.025)),
+              high95 = unname(quantile(s_C,  0.975))),
+       IC = c(mean   = mean(s_IC),
+              low95  = unname(quantile(s_IC, 0.025)),
+              high95 = unname(quantile(s_IC, 0.975))))
+}
+sA <- scenario_stocks(oc_areal_A, ic_areal_A)
+sB <- scenario_stocks(oc_areal,   ic_areal)
+
+# --- Summary table --------------------------------------------------------
+ci <- function(x) paste0("[", fmt(x["low95"]), " - ", fmt(x["high95"]), "]")
+pct_default <- function(x, ref) sprintf("%+.1f%%", (x["mean"] - ref["mean"]) / ref["mean"] * 100)
+
+sens_table <- data.frame(
+  Scenario       = c("A. Cored interval only (lower bound)",
+                     "B. Constant deepest measured density (default)"),
+  OC_stock_ton   = c(fmt(sA$OC["mean"]),  fmt(sB$OC["mean"])),
+  OC_SimInt_95   = c(ci(sA$OC),           ci(sB$OC)),
+  OC_vs_default  = c(pct_default(sA$OC, sB$OC), "0%"),
+  IC_stock_ton   = c(fmt(sA$IC["mean"]),  fmt(sB$IC["mean"])),
+  IC_SimInt_95   = c(ci(sA$IC),           ci(sB$IC)),
+  IC_vs_default  = c(pct_default(sA$IC, sB$IC), "0%"))
+
+knitr::kable(sens_table,
+  caption = paste0("Basin ", basin_label,
+                   ": stratigraphic bracket on the basin carbon stock. ",
+                   "OC_vs_default and IC_vs_default give the change ",
+                   "relative to the default (Scenario B)."))
+
+# --- Plot -----------------------------------------------------------------
+df_sens <- data.frame(
+  scenario = factor(rep(c("A. Cored only", "B. Default"), 2),
+                    levels = c("A. Cored only", "B. Default")),
+  pool     = factor(rep(c("Organic C", "Inorganic C"), each = 2),
+                    levels = c("Organic C", "Inorganic C")),
+  mean     = c(sA$OC["mean"],  sB$OC["mean"],
+               sA$IC["mean"],  sB$IC["mean"]),
+  low95    = c(sA$OC["low95"], sB$OC["low95"],
+               sA$IC["low95"], sB$IC["low95"]),
+  high95   = c(sA$OC["high95"], sB$OC["high95"],
+               sA$IC["high95"], sB$IC["high95"]))
+
+p_sens <- ggplot(df_sens, aes(scenario, mean, fill = pool)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.7,
+           colour = "black", linewidth = 0.2) +
+  geom_errorbar(aes(ymin = low95, ymax = high95),
+                position = position_dodge(width = 0.75), width = 0.2,
+                linewidth = 0.4) +
+  scale_y_continuous(labels = label_scientific()) +
+  scale_fill_manual(values = c("Organic C" = "#1b7837", "Inorganic C" = "#762a83")) +
+  labs(x = NULL, y = "Basin stock (t)", fill = NULL) +
+  theme_fig2 + theme(legend.position = "bottom")
+
+
+p_sens
+```
+
+```{r depocentre-column}
+OC_col_core <- max(core$C_acum)        # depocentre full-column OC (kg m-2)
+IC_col_core <- max(core$IC_acum)       # depocentre full-column IC (kg m-2)
+TC_col_core <- OC_col_core + IC_col_core
+IC_fraction <- IC_col_core / TC_col_core      # depocentre IC fraction of TC
+
+# Basin-mean IC fraction, for comparison with the depocentre value above
+# (manuscript Table 1, row "IC, basin / depocentre (%)")
+IC_basin_fraction <- IC_areal_basin / (OC_areal_basin + IC_areal_basin)
+
+# Depocentre concentration factor: depocentre full-column TC inventory
+# divided by the basin-mean areal TC density (manuscript §3.2 and Table 1,
+# "Depocentre concentration factor (column / basin-mean)"). This is a
+# different quantity from the sediment-focusing factor computed in the
+# "Volumetric concentration of the sediment fill" section below, which
+# compares the high-thickness zone's volume and area fractions.
+depocentre_conc_factor <- TC_col_core / (OC_areal_basin + IC_areal_basin)
+
+c(OC_col_core_kgm2       = round(OC_col_core, 1),
+  IC_col_core_kgm2       = round(IC_col_core, 1),
+  TC_col_core_kgm2       = round(TC_col_core, 1),
+  IC_fraction_depocentre = round(IC_fraction, 3),
+  IC_fraction_basin      = round(IC_basin_fraction, 3),
+  depocentre_conc_factor = round(depocentre_conc_factor, 2))
+```
+
+# Surface inventory (upper 10 cm) from replicate gravity cores
+
+The upper-10 cm inventory at the depocentre is taken from replicate gravity
+cores, summarised as mean and standard deviation across cores. For each core
+the carbon density profile is integrated from 0 to 10 cm (density interpolated
+on a fine grid, the shallowest value extended to the surface). Total carbon is
+computed directly from TC, so it is returned for every core even where organic
+carbon is not measured.
+
+```{r surface-gravity}
+grav <- read.csv("Gravities_BC_BT.csv")    # cores, depth, DBD, TC, OC
+grav <- grav[grepl(paste0("^", basin_label), grav$cores), ]   # selects this basin from the shared CSV
+
+acc10 <- function(d, zmax = 10){
+  d <- d[order(d$depth), ]
+  integ <- function(depth, dens){
+    ok <- is.finite(depth) & is.finite(dens)
+    depth <- depth[ok]; dens <- dens[ok]
+    if (length(depth) == 0) return(NA_real_)
+    zg <- seq(0, zmax, by = 0.1)
+    g  <- if (length(depth) == 1) rep(dens, length(zg))
+          else approx(depth, dens, xout = zg, rule = 2)$y
+    zm <- zg / 100
+    sum(diff(zm) * (head(g, -1) + tail(g, -1)) / 2)   # trapezoidal integral
+  }
+  rho <- d$DBD * 1000
+  data.frame(OC_10cm = integ(d$depth, rho * d$OC / 100),
+             IC_10cm = integ(d$depth, rho * (d$TC - d$OC) / 100),
+             TC_10cm = integ(d$depth, rho * d$TC / 100))   # TC: no OC needed
+}
+
+surf_tab <- do.call(rbind, by(grav, grav$cores, acc10))
+surf_tab$core <- rownames(surf_tab)
+surf_tab <- surf_tab[, c("core", "OC_10cm", "IC_10cm", "TC_10cm")]
+rownames(surf_tab) <- NULL
+
+knitr::kable(surf_tab, digits = 2,
+             caption = "Upper-10 cm carbon inventory per gravity core (kg m-2)")
+```
+
+```{r surface-gravity-summary}
+surf_stats <- function(x){
+  x <- x[is.finite(x)]
+  c(mean = mean(x), sd = sd(x), cv = sd(x) / mean(x), n = length(x))
+}
+surf_summary <- rbind(OC    = surf_stats(surf_tab$OC_10cm),
+                      IC    = surf_stats(surf_tab$IC_10cm),
+                      total = surf_stats(surf_tab$TC_10cm))
+knitr::kable(round(surf_summary, 3),
+             caption = "Upper-10 cm inventory across cores: mean, SD, CV (kg m-2). OC and IC use cores with measured OC; total uses all cores.")
+```
+
+```{r surface-gravity-ratio}
+surf_mean      <- surf_summary["total", "mean"]
+surf_sd        <- surf_summary["total", "sd"]
+col_to_surface <- TC_col_core / surf_mean
+
+round(c(n_cores                 = surf_summary["total", "n"],
+        column_to_surface_ratio = col_to_surface), 0)
+```
+
+# Volumetric concentration of the sediment fill
+
+Because carbon density is held constant across the basin, carbon per cell is
+proportional to sediment thickness, so the fraction of carbon in any region
+equals the fraction of sediment **volume** there. The high-thickness zone is
+defined as the area where mean thickness exceeds 50% of the basin maximum. Its
+area fraction, volume fraction, and the ratio between them (the
+sediment-focusing factor) describe how strongly the fill — and, under uniform
+density, the carbon — is concentrated toward the centre. These are geometric
+measures, not compositional heterogeneity, which a single core cannot resolve.
+This sediment-focusing factor is a purely geometric diagnostic of the
+high-thickness zone and should not be confused with the depocentre
+concentration factor reported in the Summary section below, which compares
+the depocentre column inventory with the basin-mean areal carbon density
+(manuscript §3.2, Table 1).
+
+```{r volumetric-concentration}
+H  <- values(r_mean)[, 1]      # mean thickness per cell (m)
+a  <- values(w)[, 1]           # effective cell area (m2)
+ok <- is.finite(H) & is.finite(a) & a > 0
+H  <- H[ok]; a <- a[ok]
+vol <- H * a                   # sediment volume per cell (proportional to carbon)
+
+thr  <- 0.50 * max(H)          # depocentre threshold: >= 50% of maximum thickness
+depo <- H >= thr
+
+depo_area_frac <- sum(a[depo])   / sum(a)
+depo_vol_frac  <- sum(vol[depo]) / sum(vol)
+focus_factor   <- depo_vol_frac / depo_area_frac   # sediment-focusing factor
+
+conc_tab <- data.frame(
+  Metric = c("High-thickness zone area fraction",
+             "High-thickness zone volume fraction",
+             "Sediment-focusing factor (volume / area)"),
+  Value  = round(c(depo_area_frac, depo_vol_frac, focus_factor), 3))
+knitr::kable(conc_tab,
+  caption = paste0("Basin ", basin_label,
+                   ": high-thickness zone (mean thickness >= 50% of basin ",
+                   "maximum), geometric concentration of the sediment fill ",
+                   "(= carbon, under uniform density). Distinct from the ",
+                   "depocentre concentration factor reported in the Summary ",
+                   "section (column inventory / basin-mean areal density)."))
+```
+
+```{r basin-overview-map, fig.width=6, fig.height=5, fig.cap=paste0("Basin ", basin_label, ": mean basin-floor bathymetry (viridis), survey-track points used in the conditional simulation (white dots), depocentre core position (red triangle), and depocentre boundary defined as mean thickness >= 50% of maximum (red contour). This figure provides the basis for Fig. 1b/1c (bathymetry, survey tracks, core site) and the high-thickness zone shown in Fig. 2c/2d of the manuscript.")}
+r_bath  <- app(r_sup, mean, na.rm = TRUE)              # mean basin-floor surface
+df_bath <- as.data.frame(r_bath,  xy = TRUE, na.rm = FALSE); colnames(df_bath)[3]  <- "depth"
+df_thick <- as.data.frame(r_mean, xy = TRUE, na.rm = FALSE); colnames(df_thick)[3] <- "thick"
+
+# Survey-track points (use the basin-floor picks as the operative track set)
+df_tracks <- data.frame(x = sup$x, y = sup$y)
+
+# --- Depocentre core coordinates -----------------------------------------
+# Recorded in degrees-decimal-minutes, WGS84:
+#   BC: 52 04.010 S, 74 55.000 W
+#   BT: 52 12.840 S, 74 50.540 W
+# Reproject to UTM Zone 18S (EPSG:32718) to match the project CRS.
+core_coords <- data.frame(
+  basin = c("BC", "BT"),
+  lat   = c(-(52 +  4.010/60), -(52 + 12.840/60)),
+  lon   = c(-(74 + 55.000/60), -(74 + 50.540/60)))
+core_xy_all <- as.data.frame(st_coordinates(
+  st_transform(
+    st_as_sf(core_coords, coords = c("lon", "lat"), crs = 4326),
+    crs = 32718)))
+core_xy_all$basin <- core_coords$basin
+colnames(core_xy_all)[1:2] <- c("x", "y")
+
+# Select the row for the current basin
+core_xy <- core_xy_all[core_xy_all$basin == basin_label, c("x", "y")]
+
+p_overview <- ggplot() +
+  geom_raster(data = df_bath, aes(x, y, fill = depth)) +
+  geom_contour(data = df_thick, aes(x, y, z = thick),
+               breaks = thr, colour = "red", linewidth = 0.6) +
+  geom_point(data = df_tracks, aes(x, y),
+             colour = "white", size = 0.15, alpha = 0.6) +
+  geom_point(data = core_xy, aes(x, y),
+             shape = 24, fill = "red", colour = "black", size = 3, stroke = 0.6) +
+  scale_fill_viridis_c(name = "Basin floor (m)", na.value = "transparent") +
+  coord_equal() +
+  labs(x = "East (m)", y = "North (m)") +
+  scale_x_continuous(n.breaks = 3) +
+  theme_fig2
+
+
+# Print the reprojected coordinates for the manuscript / records
+cat("Depocentre core position (UTM Zone 18S, EPSG:32718):\n")
+print(core_xy_all)
+
+p_overview
+```
+
+# Summary
+
+```{r summary, echo=FALSE}
+data.frame(
+  Quantity = c("Basin area (m2)", "Basin volume (m3)",
+               "Full-column OC stock (t)", "Full-column IC stock (t)",
+               "Basin-mean OC density (kg m-2)", "Basin-mean IC density (kg m-2)",
+               "Basin-mean volumetric carbon density (kg m-3)",
+               "Basin-mean IC fraction",
+               "Depocentre full-column OC (kg m-2)", "Depocentre full-column IC (kg m-2)",
+               "Depocentre IC fraction",
+               "Surficial stock total, gravity cores (kg m-2)",
+               "Surficial stock SD, gravity cores (kg m-2)",
+               "Column-to-surface ratio",
+               "Depocentre concentration factor (column / basin-mean)",
+               "Sediment-focusing factor (volume / area, high-thickness zone)"),
+  Value = c(format(round(area_real), big.mark = ","), fmt(mean_vol),
+            fmt(C_results["mean"]), fmt(IC_results["mean"]),
+            round(OC_areal_basin, 1), round(IC_areal_basin, 1),
+            round(vol_c_density, 1),
+            round(IC_basin_fraction, 3),
+            round(OC_col_core, 1), round(IC_col_core, 1), round(IC_fraction, 3),
+            round(surf_mean, 2), round(surf_sd, 2), round(col_to_surface, 0),
+            round(depocentre_conc_factor, 2),
+            round(focus_factor, 2)),
+  row.names = NULL)
+```
+
+# Session info
+
+```{r session-info, echo=FALSE}
+sessionInfo()
+```
