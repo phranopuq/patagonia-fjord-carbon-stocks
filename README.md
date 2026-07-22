@@ -24,12 +24,12 @@ below):
   Columns: `x`, `y`, `z` (UTM zone 18S, EPSG:32718; z in metres below sea
   level).
 - `BC_core.csv`, `BT_core.csv` — depocentre composite-core geochemistry.
-  Columns: `depth` (cm), `DBD` (g cm⁻³), `TC`, `OC` (wt%).
+  Columns: `depth` (cm), `DBD` (g cm⁻³), `TC`, `TOC` (wt%).
 - `BC_area.shp`, `BT_area.shp` (with sidecar `.shx`, `.dbf`, `.prj` files) —
   basin outline polygon, same CRS as above.
 - `Gravities_BC_BT.csv` — shared file with the upper-10-cm replicate gravity
   cores for both basins. Columns: `cores` (core ID, prefixed `BC`/`BT`;
-  used to select the current basin), `depth`, `DBD`, `TC`, `OC`.
+  used to select the current basin), `depth`, `DBD`, `TC`, `TOC`.
 
 ## Data availability
 Raw acoustic picks, core geochemistry, and basin outlines are not
