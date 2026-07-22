@@ -12,7 +12,7 @@ output:
     code_folding: show
     fig_caption: true
     df_print: kable
-knit: (function(inputFile, encoding) { rmarkdown::render(inputFile, encoding = encoding, output_dir = "output", output_file = paste0("CARBON_STOCKS_", rmarkdown::yaml_front_matter(inputFile)$params$basin, ".html")) })
+knit: (function(inputFile, encoding) { rmarkdown::render(inputFile, encoding = encoding, output_file = paste0("CARBON_STOCKS_", rmarkdown::yaml_front_matter(inputFile)$params$basin, ".html")) })
 ---
 
 ```{r setup, include=FALSE}
@@ -87,12 +87,12 @@ f_outline <- paste0(basin_label, "_area.shp")
 ```{r data}
 sup  <- read.csv(f_surface)    # basin floor (x, y, z)
 fon  <- read.csv(f_bottom)     # basal acoustic horizon, base of post-glacial sediment fill (x, y, z)
-core <- read.csv(f_core)       # composite core: depth, DBD, TC, OC
+core <- read.csv(f_core)       # composite core: depth, DBD, TC, TOC
 shp  <- vect(f_outline)        # basin outline
 
 stopifnot(all(c("x", "y", "z") %in% colnames(sup)))
 stopifnot(all(c("x", "y", "z") %in% colnames(fon)))
-stopifnot(all(c("depth", "DBD", "TC", "OC") %in% colnames(core)))
+stopifnot(all(c("depth", "DBD", "TC", "TOC") %in% colnames(core)))
 ```
 
 ```{r picked-thickness-envelope}
@@ -368,11 +368,11 @@ p_thickness
 
 # Core geochemistry and carbon density profiles
 
-Total carbon (TC) is measured by elemental analysis and organic carbon (OC) by
-combustion after acid digestion to remove carbonate; inorganic carbon (IC) is
-taken as the difference: IC = TC − OC. Dry bulk density (DBD) is converted to
+Total carbon (TC) is measured by elemental analysis and organic carbon (TOC) by
+combustion after acid digestion to remove carbonate; inorganic carbon (TIC) is
+taken as the difference: TIC = TC − TOC. Dry bulk density (DBD) is converted to
 kg m^-3^ by multiplying by 1000. Organic and inorganic carbon densities are
-obtained by multiplying DBD by OC and IC, each divided by 100 (OC and IC are
+obtained by multiplying DBD by TOC and TIC, each divided by 100 (TOC and TIC are
 recorded as weight percent). Each density profile is integrated over depth to
 give cumulative organic and inorganic carbon (kg m^-2^).
 
@@ -381,26 +381,26 @@ core <- core[order(core$depth), ]
 core <- core[!duplicated(core$depth), ]
 
 core$rho_kg_m3 <- core$DBD * 1000        # dry bulk density (kg m-3)
-core$IC        <- core$TC - core$OC      # inorganic carbon (wt%) = TC - OC
-core$fC        <- core$OC / 100          # OC mass fraction
-core$fIC       <- core$IC / 100          # IC mass fraction
-core$dens_C    <- core$rho_kg_m3 * core$fC    # OC density (kg m-3)
-core$dens_IC   <- core$rho_kg_m3 * core$fIC   # IC density (kg m-3)
+core$TIC        <- core$TC - core$TOC      # inorganic carbon (wt%) = TC - OC
+core$fC        <- core$TOC / 100          # TOC mass fraction
+core$fIC       <- core$TIC / 100          # TIC mass fraction
+core$dens_C    <- core$rho_kg_m3 * core$fC    # TOC density (kg C m-3)
+core$dens_IC   <- core$rho_kg_m3 * core$fIC   # TIC density (kg C m-3)
 
 dz          <- diff(core$depth) / 100        # m (depth in cm)
 core$C_acum  <- cumsum(c(0, core$dens_C[-1]  * dz))
 core$IC_acum <- cumsum(c(0, core$dens_IC[-1] * dz))
 ```
 
-```{r core-figure, fig.width=8, fig.height=4, fig.cap=paste0("Basin ", basin_label, ": down-core organic and inorganic carbon density (kg m-3) and cumulative carbon (kg m-2).")}
+```{r core-figure, fig.width=8, fig.height=4, fig.cap=paste0("Basin ", basin_label, ": down-core organic and inorganic volumetric carbon density (kg C m-3) and cumulative carbon (kg C m-2).")}
 p1 <- ggplot(core, aes(dens_C,  depth)) + geom_path() + scale_y_reverse() +
-  labs(x = "OC density (kg m-3)", y = "Depth (cm)") + theme_fig2
+  labs(x = "TOC density (kg C m-3)", y = "Depth (cm)") + theme_fig2
 p2 <- ggplot(core, aes(dens_IC, depth)) + geom_path() + scale_y_reverse() +
-  labs(x = "IC density (kg m-3)", y = "") + theme_fig2
+  labs(x = "TIC density (kg C m-3)", y = "") + theme_fig2
 p3 <- ggplot(core, aes(C_acum,  depth)) + geom_path(linewidth = 1) + scale_y_reverse() +
-  labs(x = "Cumulative OC (kg m-2)", y = "") + theme_fig2
+  labs(x = "Cumulative TOC (kg C m-2)", y = "") + theme_fig2
 p4 <- ggplot(core, aes(IC_acum, depth)) + geom_path(linewidth = 1) + scale_y_reverse() +
-  labs(x = "Cumulative IC (kg m-2)", y = "") + theme_fig2
+  labs(x = "Cumulative TIC (kg C m-2)", y = "") + theme_fig2
 p_core <- (p1 | p2 | p3 | p4) + plot_annotation(tag_levels = "a")
 
 p_core
@@ -409,14 +409,14 @@ p_core
 # Basin carbon stock (full sediment column)
 
 The carbon held in a column of thickness *H* is the cumulative carbon profile
-evaluated at *H* (kg m^-2^). Below the deepest sample, density is held
+evaluated at *H* (kg C m^-2^). Below the deepest sample, density is held
 constant at the deepest measured value (this rule is supported by the
-down-core stabilisation of OC and IC densities noted in the manuscript from
+down-core stabilisation of TOC and TIC densities noted in the manuscript from
 7.5 m in BC and 8.0 m in BT; Fig. 3). The per-cell areal carbon density is
 then multiplied by the same effective cell area used for the volume, and the
 resulting cell inventories are summed over the basin for each of the 1000
 realisations. Evaluated at the core base, the same profile gives the
-full-column inventory at the depocentre (kg m^-2^), reported at the end of
+full-column inventory at the depocentre (kg C m^-2^), reported at the end of
 this section.
 
 ```{r carbon-functions}
@@ -438,8 +438,8 @@ areal_IC <- function(H_m, cap_cm = Inf){
 }
 
 # sanity check: must reproduce the core inventory at the core base
-c(OC_core_kgm2 = areal_C(H_core_max_cm / 100),
-  IC_core_kgm2 = areal_IC(H_core_max_cm / 100))
+c(TOC_core_kgm2 = areal_C(H_core_max_cm / 100),
+  TIC_core_kgm2 = areal_IC(H_core_max_cm / 100))
 ```
 
 ```{r basin-stock}
@@ -464,10 +464,10 @@ OC_areal_basin <- mean(stock_C)  / area_real
 IC_areal_basin <- mean(stock_IC) / area_real
 
 data.frame(
-  OC_stock_ton = fmt(C_results["mean"]),
-  OC_SimInt_95 = paste0("[", fmt(C_results["low95"]), " - ", fmt(C_results["high95"]), "]"),
-  IC_stock_ton = fmt(IC_results["mean"]),
-  IC_SimInt_95 = paste0("[", fmt(IC_results["low95"]), " - ", fmt(IC_results["high95"]), "]"),
+  TOC_stock_ton = fmt(C_results["mean"]),
+  TOC_SimInt_95 = paste0("[", fmt(C_results["low95"]), " - ", fmt(C_results["high95"]), "]"),
+  TIC_stock_ton = fmt(IC_results["mean"]),
+  TIC_SimInt_95 = paste0("[", fmt(IC_results["low95"]), " - ", fmt(IC_results["high95"]), "]"),
   row.names = NULL
 )
 ```
@@ -482,8 +482,8 @@ crosscheck_C_ton <- mean(vol_values) * mean(core$dens_C) / 1e3
 mean_thick    <- mean_vol / area_real                                 # m
 vol_c_density <- (OC_areal_basin + IC_areal_basin) / mean_thick       # kg m-3
 
-c(OC_areal_basin_kgm2 = round(OC_areal_basin, 1),
-  IC_areal_basin_kgm2 = round(IC_areal_basin, 1),
+c(TOC_areal_basin_kgm2 = round(OC_areal_basin, 1),
+  TIC_areal_basin_kgm2 = round(IC_areal_basin, 1),
   mean_thick_m         = round(mean_thick, 2),
   vol_c_density_kgm3   = round(vol_c_density, 1),
   convergence_ratio    = round(as.numeric(crosscheck_C_ton / C_results["mean"]), 3))
@@ -633,29 +633,22 @@ p_thick_hist
 The depocentre core samples only the upper portion of the simulated acoustic
 fill. Two end-member scenarios bracket the basin stock without invoking any
 external value for the un-cored interval:
-
-- **A. Cored interval only (lower bound).** The column inventory is capped at
-  the core base; sediment below this depth is assigned zero carbon. This is
-  the stock that the core directly supports.
-- **B. Constant deepest measured density (default reported).** The deepest
+- **A. Constant deepest measured density (default reported).** The deepest
   cored value is extended downward through the un-cored fill. Geologically
   justified when the deep cored facies is interpreted as continuing below the
-  core base (glaciomarine in BC, glaciolacustrine in BT; Rios et al., 2020).
+  core base (Rios et al., 2020).
+- **B. Cored interval only (lower bound).** The column inventory is capped at
+  the core base; sediment below this depth is assigned zero carbon. This is
+  the stock that the core directly supports.
 
-A third intermediate scenario using a low-OC analogue density for the deep
-facies (e.g., from a comparable Patagonian glaciomarine or glaciolacustrine
-core) can be added here once a literature value is selected. It is left out
-of the present run because we do not want to anchor the bracket on an
-unsourced assumption.
+```{r sensitivity-stratigraphic, fig.width=6, fig.height=4.5, fig.cap=paste0("Basin ", basin_label, ": stratigraphic bracket on the basin organic (TOC) and inorganic (TIC) carbon stock. Scenario A extends the deepest measured density to the basal acoustic horizon (default). Scenario B caps the column at the depocentre core base (", round(H_core_max_m, 2), " m). Bars are means across the 1000 thickness realisations; whiskers are 95% intervals.")}
 
-```{r sensitivity-stratigraphic, fig.width=6, fig.height=4.5, fig.cap=paste0("Basin ", basin_label, ": stratigraphic bracket on the basin organic (OC) and inorganic (IC) carbon stock. Scenario A caps the column at the depocentre core base (", round(H_core_max_m, 2), " m); Scenario B extends the deepest measured density to the basal acoustic horizon (default). Bars are means across the 1000 thickness realisations; whiskers are 95% intervals.")}
-
-# --- Scenario A: cored-interval cap ---------------------------------------
-oc_areal_A <- apply(H_mat, 2, function(h) areal_C (h, cap_cm = H_core_max_cm))
-ic_areal_A <- apply(H_mat, 2, function(h) areal_IC(h, cap_cm = H_core_max_cm))
-
-# --- Scenario B: default (already computed) -------------------------------
+# --- Scenario A: default (already computed) -------------------------------
 # oc_areal, ic_areal carry the upper-bound (constant deepest density) result.
+# --- Scenario B: cored-interval cap ---------------------------------------
+
+oc_areal_B <- apply(H_mat, 2, function(h) areal_C (h, cap_cm = H_core_max_cm))
+ic_areal_B <- apply(H_mat, 2, function(h) areal_IC(h, cap_cm = H_core_max_cm))
 
 # --- Summarise each scenario ----------------------------------------------
 scenario_stocks <- function(oc_a, ic_a){
@@ -668,35 +661,37 @@ scenario_stocks <- function(oc_a, ic_a){
               low95  = unname(quantile(s_IC, 0.025)),
               high95 = unname(quantile(s_IC, 0.975))))
 }
-sA <- scenario_stocks(oc_areal_A, ic_areal_A)
-sB <- scenario_stocks(oc_areal,   ic_areal)
+sA <- scenario_stocks(oc_areal,   ic_areal)
+sB <- scenario_stocks(oc_areal_B, ic_areal_B)
+
 
 # --- Summary table --------------------------------------------------------
 ci <- function(x) paste0("[", fmt(x["low95"]), " - ", fmt(x["high95"]), "]")
 pct_default <- function(x, ref) sprintf("%+.1f%%", (x["mean"] - ref["mean"]) / ref["mean"] * 100)
 
 sens_table <- data.frame(
-  Scenario       = c("A. Cored interval only (lower bound)",
-                     "B. Constant deepest measured density (default)"),
-  OC_stock_ton   = c(fmt(sA$OC["mean"]),  fmt(sB$OC["mean"])),
-  OC_SimInt_95   = c(ci(sA$OC),           ci(sB$OC)),
-  OC_vs_default  = c(pct_default(sA$OC, sB$OC), "0%"),
-  IC_stock_ton   = c(fmt(sA$IC["mean"]),  fmt(sB$IC["mean"])),
-  IC_SimInt_95   = c(ci(sA$IC),           ci(sB$IC)),
-  IC_vs_default  = c(pct_default(sA$IC, sB$IC), "0%"))
+  Scenario       = c("A. Constant deepest measured density (default)",
+                     "B. Cored interval only (lower bound)"),
+  TOC_stock_ton   = c(fmt(sA$OC["mean"]),  fmt(sB$OC["mean"])),
+  TOC_SimInt_95   = c(ci(sA$OC),           ci(sB$OC)),
+  TOC_vs_default  = c("0%", pct_default(sB$OC, sA$OC)),
+  TIC_stock_ton   = c(fmt(sA$IC["mean"]),  fmt(sB$IC["mean"])),
+  TIC_SimInt_95   = c(ci(sA$IC),           ci(sB$IC)),
+  TIC_vs_default  = c("0%", pct_default(sB$IC, sA$IC)))
+
 
 knitr::kable(sens_table,
   caption = paste0("Basin ", basin_label,
                    ": stratigraphic bracket on the basin carbon stock. ",
-                   "OC_vs_default and IC_vs_default give the change ",
-                   "relative to the default (Scenario B)."))
+                   "TOC_vs_default and TIC_vs_default give the change ",
+                   "relative to the default (Scenario A)."))
 
 # --- Plot -----------------------------------------------------------------
 df_sens <- data.frame(
-  scenario = factor(rep(c("A. Cored only", "B. Default"), 2),
-                    levels = c("A. Cored only", "B. Default")),
-  pool     = factor(rep(c("Organic C", "Inorganic C"), each = 2),
-                    levels = c("Organic C", "Inorganic C")),
+  scenario = factor(rep(c("A. Default", "B. Cored only"), 2),
+                    levels = c("A. Default", "B. Cored only")),
+  pool     = factor(rep(c("TOC", "TIC"), each = 2),
+                    levels = c("TOC", "TIC")),
   mean     = c(sA$OC["mean"],  sB$OC["mean"],
                sA$IC["mean"],  sB$IC["mean"]),
   low95    = c(sA$OC["low95"], sB$OC["low95"],
@@ -711,7 +706,7 @@ p_sens <- ggplot(df_sens, aes(scenario, mean, fill = pool)) +
                 position = position_dodge(width = 0.75), width = 0.2,
                 linewidth = 0.4) +
   scale_y_continuous(labels = label_scientific()) +
-  scale_fill_manual(values = c("Organic C" = "#1b7837", "Inorganic C" = "#762a83")) +
+  scale_fill_manual(values = c("TOC" = "#1b7837", "TIC" = "#762a83")) +
   labs(x = NULL, y = "Basin stock (t)", fill = NULL) +
   theme_fig2 + theme(legend.position = "bottom")
 
@@ -720,13 +715,13 @@ p_sens
 ```
 
 ```{r depocentre-column}
-OC_col_core <- max(core$C_acum)        # depocentre full-column OC (kg m-2)
-IC_col_core <- max(core$IC_acum)       # depocentre full-column IC (kg m-2)
+OC_col_core <- max(core$C_acum)        # depocentre full-column TOC (kg C m-2)
+IC_col_core <- max(core$IC_acum)       # depocentre full-column TIC (kg C m-2)
 TC_col_core <- OC_col_core + IC_col_core
-IC_fraction <- IC_col_core / TC_col_core      # depocentre IC fraction of TC
+IC_fraction <- IC_col_core / TC_col_core      # depocentre TIC fraction of TC
 
-# Basin-mean IC fraction, for comparison with the depocentre value above
-# (manuscript Table 1, row "IC, basin / depocentre (%)")
+# Basin-mean TIC fraction, for comparison with the depocentre value above
+# (manuscript Table 1, row "TIC, basin / depocentre (%)")
 IC_basin_fraction <- IC_areal_basin / (OC_areal_basin + IC_areal_basin)
 
 # Depocentre concentration factor: depocentre full-column TC inventory
@@ -737,11 +732,11 @@ IC_basin_fraction <- IC_areal_basin / (OC_areal_basin + IC_areal_basin)
 # compares the high-thickness zone's volume and area fractions.
 depocentre_conc_factor <- TC_col_core / (OC_areal_basin + IC_areal_basin)
 
-c(OC_col_core_kgm2       = round(OC_col_core, 1),
-  IC_col_core_kgm2       = round(IC_col_core, 1),
+c(TOC_col_core_kgm2       = round(OC_col_core, 1),
+  TIC_col_core_kgm2       = round(IC_col_core, 1),
   TC_col_core_kgm2       = round(TC_col_core, 1),
-  IC_fraction_depocentre = round(IC_fraction, 3),
-  IC_fraction_basin      = round(IC_basin_fraction, 3),
+  TIC_fraction_depocentre = round(IC_fraction, 3),
+  TIC_fraction_basin      = round(IC_basin_fraction, 3),
   depocentre_conc_factor = round(depocentre_conc_factor, 2))
 ```
 
@@ -755,7 +750,7 @@ computed directly from TC, so it is returned for every core even where organic
 carbon is not measured.
 
 ```{r surface-gravity}
-grav <- read.csv("Gravities_BC_BT.csv")    # cores, depth, DBD, TC, OC
+grav <- read.csv("Gravities_BC_BT.csv")    # cores, depth, DBD, TC, TOC
 grav <- grav[grepl(paste0("^", basin_label), grav$cores), ]   # selects this basin from the shared CSV
 
 acc10 <- function(d, zmax = 10){
@@ -771,18 +766,18 @@ acc10 <- function(d, zmax = 10){
     sum(diff(zm) * (head(g, -1) + tail(g, -1)) / 2)   # trapezoidal integral
   }
   rho <- d$DBD * 1000
-  data.frame(OC_10cm = integ(d$depth, rho * d$OC / 100),
-             IC_10cm = integ(d$depth, rho * (d$TC - d$OC) / 100),
+  data.frame(TOC_10cm = integ(d$depth, rho * d$TOC / 100),
+             TIC_10cm = integ(d$depth, rho * (d$TC - d$TOC) / 100),
              TC_10cm = integ(d$depth, rho * d$TC / 100))   # TC: no OC needed
 }
 
 surf_tab <- do.call(rbind, by(grav, grav$cores, acc10))
 surf_tab$core <- rownames(surf_tab)
-surf_tab <- surf_tab[, c("core", "OC_10cm", "IC_10cm", "TC_10cm")]
+surf_tab <- surf_tab[, c("core", "TOC_10cm", "TIC_10cm", "TC_10cm")]
 rownames(surf_tab) <- NULL
 
 knitr::kable(surf_tab, digits = 2,
-             caption = "Upper-10 cm carbon inventory per gravity core (kg m-2)")
+             caption = "Upper-10 cm carbon inventory per gravity core (kg C m-2)")
 ```
 
 ```{r surface-gravity-summary}
@@ -794,7 +789,7 @@ surf_summary <- rbind(OC    = surf_stats(surf_tab$OC_10cm),
                       IC    = surf_stats(surf_tab$IC_10cm),
                       total = surf_stats(surf_tab$TC_10cm))
 knitr::kable(round(surf_summary, 3),
-             caption = "Upper-10 cm inventory across cores: mean, SD, CV (kg m-2). OC and IC use cores with measured OC; total uses all cores.")
+             caption = "Upper-10 cm inventory across cores: mean, SD, CV (kg C m-2). TOC and TIC use cores with measured TOC; total uses all cores.")
 ```
 
 ```{r surface-gravity-ratio}
@@ -904,14 +899,14 @@ p_overview
 ```{r summary, echo=FALSE}
 data.frame(
   Quantity = c("Basin area (m2)", "Basin volume (m3)",
-               "Full-column OC stock (t)", "Full-column IC stock (t)",
-               "Basin-mean OC density (kg m-2)", "Basin-mean IC density (kg m-2)",
-               "Basin-mean volumetric carbon density (kg m-3)",
-               "Basin-mean IC fraction",
-               "Depocentre full-column OC (kg m-2)", "Depocentre full-column IC (kg m-2)",
-               "Depocentre IC fraction",
-               "Surficial stock total, gravity cores (kg m-2)",
-               "Surficial stock SD, gravity cores (kg m-2)",
+               "Full-column TOC stock (t)", "Full-column TIC stock (t)",
+               "Basin-mean TOC areal density (kg C m-2)", "Basin-mean TIC areal density (kg C m-2)",
+               "Basin-mean volumetric carbon density (kg C m-3)",
+               "Basin-mean TIC fraction",
+               "Depocentre full-column TOC (kg C m-2)", "Depocentre full-column TIC (kg C m-2)",
+               "Depocentre TIC fraction",
+               "Surficial stock total, gravity cores (kg C m-2)",
+               "Surficial stock SD, gravity cores (kg C m-2)",
                "Column-to-surface ratio",
                "Depocentre concentration factor (column / basin-mean)",
                "Sediment-focusing factor (volume / area, high-thickness zone)"),
